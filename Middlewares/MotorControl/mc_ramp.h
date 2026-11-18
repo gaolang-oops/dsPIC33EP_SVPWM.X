@@ -1,0 +1,81 @@
+/*
+ * mc_ramp.h
+ *
+ * 占空比缓变模块（控制策略层，纯软件，无硬件依赖）
+ * 职责：目标速度(UQ0.16) → 目标占空比换算 + 占空比域缓变。
+ *
+ * 依赖方向：mc_ramp → mc_services（时基/目标值）
+ */
+
+#ifndef MC_RAMP_H
+#define MC_RAMP_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* 缓变参数 -- SPWM(满量程 3500) 台架值：
+ *   step_big=100, step_small=25, threshold=100
+ * 运行时仍由 Ramp_Handle_t 字段承载（可调）。 */
+#define RAMP_STEP_BIG        100U    /* 差距>阈值 时的大步进 */
+#define RAMP_STEP_SMALL       25U    /* 差距≤阈值 时的小步进 */
+#define RAMP_THRESHOLD       100U    /* 大/小步进分界 */
+#define RAMP_PERIOD_MS        50U    /* 缓变节拍周期(ms) */
+
+/* 目标速度来源回调。返回目标速度 UQ0.16（0~65536 ↔ 0~100%）。
+ * - 默认实现: MC_GetKnobSpeed()（旋钮直驱，开环；含 5%~95% 限幅）
+ * - 速度环接入时: 替换为速度 PI 调节器输出，无需改 MC_Ramp_Step
+ * 注入点 = MC_Ramp_SetTargetProvider，状态机之外可热切换 */
+typedef uint16_t (*Ramp_TargetProvider_t)(void);
+
+typedef struct {
+    uint16_t target_duty;      /* 目标占空比（由目标速度换算：speed×FULLSCALE>>16） */
+    uint16_t current_duty;     /* 当前占空比（软件影子，权威值 */
+    uint16_t step_big;
+    uint16_t step_small;
+    uint16_t threshold;
+    uint16_t ramp_period_ms;
+    uint16_t last_tick_ms;     /* 上次缓变时间戳 */
+} Ramp_Handle_t;
+
+/* 初始化：占空比影子清零，时基种子同步 */
+void MC_Ramp_Init(void);
+
+/* 一步缓变：差距>阈值用大步进，否则小步进，防过冲 clamp。
+ * 只更新 target_duty / current_duty 参考，不写任何硬件。
+ * 每个主循环调用一次，内部自行判节拍是否到点；输出由调用方
+ * 在 SPWM 调制节拍(50µs)调用。 */
+void MC_Ramp_Step(void);
+
+/* 获取当前占空比（软件影子，权威值）。
+ */
+uint16_t MC_Ramp_GetCurrentDuty(void);
+
+/* 强制清零占空比影子（停机用） */
+void MC_Ramp_ForceZero(void);
+
+/* 启动保持：把 target/current 直接置为固定 duty，并重置缓变计时。
+ * 供 READY→STARTUP 使用：固定低 duty 输出一段时间，等转子加速后再进 RUNNING。
+ * 不做缓变，调用后立即生效；入参超过满量程时自动钳位。 */
+void MC_Ramp_HoldDuty(uint16_t duty);
+
+/* 请求缓停：忽略 target provider，把 current_duty 按正常缓变速率降到 0。
+ * 到 0 后自动清除请求；可重复调用。 */
+void MC_Ramp_RequestStop(void);
+
+/* 获取缓变句柄指针（供 Motor_Handle_t 聚合） */
+Ramp_Handle_t* MC_Ramp_GetHandle(void);
+
+/* 设置目标速度来源（速度环接缝）。
+ * provider=NULL 视为非法，忽略不切换。
+ * 默认指向 MC_GetKnobSpeed（旋钮直驱）。 */
+void MC_Ramp_SetTargetProvider(Ramp_TargetProvider_t provider);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* MC_RAMP_H */

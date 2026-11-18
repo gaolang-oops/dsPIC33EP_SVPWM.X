@@ -1,0 +1,360 @@
+/*
+ * File:   motor_control.c
+ * Author: gaol
+ *
+ * 电机层统一编排入口（对齐 ST MCSDK M1 任务接缝思想）：
+ *   - Motor_Init    : 集中初始化 motor 层全部子模块（状态机/Ramp/SPWM/Hall/Fault）
+ *   - Motor_Tick    : 1ms 节拍推进状态机（Tier-2 控制层），由主循环调用
+ *
+ * 驱动方式固定为 SPWM 正弦调制，状态机经 Drive_Enable() 门面统一使能/失能。
+ *
+ * 命令模型（对齐 ST MCSDK DirectCommand）：
+ *   应用层（按键/协议）经 Motor_SetCommand 下发一次性命令
+ *   （START_FWD/START_REV/STOP），状态机每拍快照后清零消费 —— 状态机不写回命令。
+ *   重启须显式再次下发 START_xxx（故障清除 / 超时后自动 re-arm，无电平残留）。
+ *   方向随启动命令携带，且仅在 STOPPED 态响应：运行中不能换向。
+ *
+ * 方向锁存（两段式）：
+ *   s_direction : 用户期望方向，STOPPED 收到 START_FWD/REV 时更新；
+ *   观测器参考方向：由 HALL 模块唯一持有（HALL_SetDirection/GetDirection），
+ *   READY 且确认转子停稳后才由控制层写入，控制层不另存副本。
+ *   两者分离是为了避免"转子还在旧方向惰行、观测器已按新方向积分"。
+ */
+
+#include "motor_control.h"
+#include "pwm_common.h"
+#include "spwm.h"
+#include "mc_ramp.h"
+#include "mc_services.h"   /* 时基 + 旋钮指令（motor 层唯一平台接缝）*/
+#include "MC_Fault.h"      /* MC_HasAnyFault / MC_Fault_Init */
+#include "hall_speed_fdbk.h"
+#include "rotor_angle.h"   /* 转子电角度观测（Hall 重同步 + 50µs 积分） */
+
+static Motor_State_e s_motor_state = MOTOR_STATE_STOPPED;
+static uint16_t s_bootstrap_start_ms = 0;        /* 自举充电起始时间戳 */
+static uint16_t s_ready_ms = 0;                  /* READY 态停留计时 */
+static uint16_t s_startup_ms = 0;                /* STARTUP 启动保持起始时间戳 */
+static Motor_Cmd_e s_command = MOTOR_CMD_NONE;   /* 一次性命令锁存（应用层写，状态机消费清零）*/
+static HALL_Dir_e  s_direction = HALL_DIR_FWD;   /* 期望方向（启动命令携带，仅 STOPPED 更新）*/
+static Motor_Handle_t s_motor_handle;            /* 统一句柄（快照聚合）*/
+
+/* 输出门面（模式分发） */
+static void Drive_Output(void);
+
+/* 旋钮门限（UQ0.16），启动/运行构成 2% 回差，避免边界来回启停。
+ * SPWM：12% 启动 / 10% 停止（实测 9% 转不动）。
+ * 均高于 mc_services 的 5% 输入死区，可被 MC_GetKnobSpeed() 观察到。 */
+#define READY_MIN_KNOB_UQ16       7864u    /* 12% */
+#define RUN_MIN_KNOB_UQ16         6554u    /* 10% */
+
+/* 启动种子：静止时没有 Hall 边沿 -> dt=0 -> RotorAngle 不积分。
+ * 进入 RUNNING 前按 50rpm 给 dt 一个初值，让角度立即开始旋转；
+ * 真实 Hall 沿到来后由 HALL_UpdateDt/HALL_UpdateStep 用实测值替换。
+ *
+ * 50 rpm @ p=2, Fpwm=20kHz:
+ *   step = 65536 × (rpm/60 × p) / Fpwm
+ *        = 65536 × (50/60 × 2) / 20000 = 5.4613 brad16/tick
+ * 启动只需近似，取整为 5 brad16/tick（约 45.8 rpm）。
+ * 改 rpm/极对数/PWM 频率时按上式重算。 */
+#define STARTUP_STEP_INT         5u
+
+static void Motor_SeedRotorSpeed(void) {
+    /* dt = K / step；K 为 uint32、step 为 uint16，用 32/16 除法 builtin */
+    uint16_t dt = __builtin_divud(HALL_GetStepK(), STARTUP_STEP_INT);
+    HALL_SeedDt(dt);
+}
+
+/* 50µs ADC tick：转子角观测 + 调制输出。
+ * 观测（Hall 重同步 / 16.16 积分 / 超时冻结）已收敛到 rotor_angle 模块；
+ * 本函数只负责同一节拍触发输出。
+ * 故障闸门在本层判断，使能闸门由 SPWM_Output 内部自查。 */
+static void Motor_Tick50us(void) {
+    RotorAngle_Tick50us();
+
+    if (!MC_HasAnyFault()) {
+        Drive_Output();
+    }
+}
+
+/*
+ * 转子角 θr → SPWM 调制角 θmod
+ *   FWD: θmod = θr + 90°（电压矢量落 q 轴，最大转矩）
+ *   REV: θmod = θr − 90°（角增量已按参考方向取负，超前同样取负）
+ * brad16 域直接加减，uint16 溢出即 360° 回卷；只取整数部分，
+ * 分辨率 0.0055°，对 20kHz 调制足够（低 16 位小数不参与本次合成）。
+ * 并发：RotorAngle_GetRotor16() 为 16 位单字读，原子。
+ */
+uint16_t Motor_GetModAngle16(void) {
+    int16_t lead = SPWM_ANGLE_LEAD_Q16;
+
+    if (HALL_GetDirection() == HALL_DIR_REV) {
+        lead = (int16_t)(-lead);
+    }
+    return (uint16_t)(RotorAngle_GetRotor16() + (uint16_t)lead);
+}
+
+void Motor_SetCommand(Motor_Cmd_e cmd) {
+    s_command = cmd;   /* 末写胜；单一应用上下文（主循环 Tier-4），无竞态 */
+}
+
+/* ============ 驱动算法统一使能门面 ============
+ * 状态机对"使能/失能驱动输出"的唯一入口：
+ *   SPWM_Enable（零矢量预置 + 交还互补自主控制，闸门在 spwm 模块）
+ */
+static void Drive_Enable(bool en) {
+    SPWM_Enable(en);
+}
+
+/* 驱动闸门快照（供 Motor_GetHandle 诊断字段） */
+static bool Drive_IsEnabled(void) {
+    return SPWM_IsEnabled();
+}
+
+/* MC_Fault 过流 ISR 的失能钩子：只做关断，保持 MC_Fault 不反向依赖本模块。
+ * 注册在 Motor_Init（GlobalEnable 之前），ISR 内只读函数指针 + 写寄存器。 */
+static void Motor_DriveOffHook(void) {
+    Drive_Enable(false);
+}
+
+/* ============ 驱动算法统一输出门面 ============
+ * mc_ramp 只维护 current_duty 参考，不碰硬件；
+ * SPWM：Motor_Tick50us（50µs）→ θmod + 幅值 → 三相正弦独立写 PDC。
+ */
+static void Drive_Output(void) {
+    SPWM_Output(Motor_GetModAngle16(), MC_Ramp_GetCurrentDuty());
+}
+
+/* BSP init 段之后、中断 GlobalEnable 之前完成Motor_Init */
+void Motor_Init(void) {
+    s_motor_state = MOTOR_STATE_STOPPED;
+    s_command     = MOTOR_CMD_NONE;
+    s_direction   = HALL_DIR_FWD;
+    s_ready_ms    = 0;
+    s_startup_ms  = 0;
+    MC_Ramp_Init();
+
+    /* 过流保护先注册，保证 50µs 回调里保护先于角度/调制 */
+    MC_Fault_Init();
+
+    /* Hall 种子读取 + 注册 IC ISR → BSP。
+     * 此处仍在全局中断关闭期间（main.c 到 Motor_Init 之后才 GlobalEnable），
+     * HALL_Init 只做种子读取/ISR 注册、不会触发 s_on_edge；
+     * 角度观察者在下面注册，首次真实 Hall 沿发生在开中断之后，不会漏。 */
+    HALL_Init();
+
+    /* 上电参考方向固定正转（HALL_Init 不重置方向，此处把契约写死，
+     * 防以后软重入/重复 Init 时残留上次运行方向）。
+     * 注意：s_direction 只是期望方向，真正切参考系统一在 READY 停稳门处执行。 */
+    HALL_SetDirection(s_direction);
+
+    /* 
+     * θr 观测由 rotor_angle 负责：RotorAngle_Init 注册角度观察者，
+     * 并用上面 HALL_Init 的种子角初始化。 */
+    RotorAngle_Init();
+    MC_RegisterTick50us(Motor_Tick50us);
+
+    /* 注入过流 ISR 的驱动失能钩子：MC_Fault 只持有回调，不认识本模块。
+     * 须在 GlobalEnable 之前完成（main.c 在 Motor_Init 后才开全局中断）。 */
+    MC_Fault_SetDriveOffHook(Motor_DriveOffHook);
+
+    /* 显式以驱动关闭态进入：不依赖各子模块 init 的副作用/静态初值。
+     * SPWM_Enable(false) 清软件闸门 + PWM_AllOff；MCC 上电配置本身也是
+     * Override 全关(OVRENH/L=1, OVRDAT=00)，此处再兜一层。
+     * 必须在 SYSTEM_Initialize()（PWM 已初始化）之后调用，main.c 顺序满足。 */
+    Drive_Enable(false);
+
+    /* 绑定统一句柄 */
+    s_motor_handle.state            = MOTOR_STATE_STOPPED;
+    s_motor_handle.dir              = (uint8_t)s_direction;
+    s_motor_handle.active_dir       = (uint8_t)HALL_GetDirection();
+    s_motor_handle.ramp             = MC_Ramp_GetHandle();
+    s_motor_handle.fault            = MC_FAULT_NONE;
+    s_motor_handle.hall_status      = 0;
+    s_motor_handle.drive_en         = false;
+    s_motor_handle.target_duty      = 0;
+    s_motor_handle.current_duty     = 0;
+    s_motor_handle.last_edge_age_ms = 0;
+}
+
+void Motor_Tick(void) {
+    /* 故障优先于一切：任意运行态 + fault → 立即进入 FAULT 吸收态。
+     * 全锁存策略：FAULT 态不清零 fault 标志。
+     * 清除途径：MC_Fault_Init（冷启动）或外部命令（MC_ClearAllFaults）/ 按键。
+     * 清除后 FAULT → STOPPED（下拍再判启动），避免清故障瞬间高压启动。 */
+
+    /* L2 慢保护：VBUS 过/欠压检查（1ms 节拍，ms 级响应）。
+     * 过流走 Tier-1 ISR（50us 回调），不在此处。 */
+    MC_Fault_CheckVoltage();
+
+    /* L2 慢保护：持续过载/堵转检查（1ms 节拍）。
+     * 对 Ibus 做一阶 IIR 低通(τ≈128ms)，超过持续阈值置 OVERLOAD。
+     * 与瞬时过流(短路)互补：堵转电流可能不超瞬时阈值却持续发热。 */
+    MC_Fault_CheckOverload();
+
+    /* L2 慢保护：霍尔信号丢失检查（1ms 节拍，仅 RUNNING 态生效）。
+     * 运行中距上次合法 Hall 边沿超 HALL_TIMEOUT_MS 置 HALL_TIMEOUT。
+     * hall_age 经 HALL_MsSinceLastEdge() 传入,避免 MC_Fault 反向依赖 hall 模块[fault读hall模块]。 */
+    MC_Fault_CheckHall(HALL_MsSinceLastEdge(), s_motor_state == MOTOR_STATE_RUNNING);
+
+    /* 一次性命令快照：本拍消费后清零（状态机不写回，重启须显式 START）。 */
+    Motor_Cmd_e cmd = s_command;
+    s_command = MOTOR_CMD_NONE;
+
+    /* 故障优先分流：任意 fault → FAULT 态。 */
+    if (MC_HasAnyFault()) {
+        s_motor_state = MOTOR_STATE_FAULT;
+    } else if (cmd == MOTOR_CMD_STOP) {
+		/* 
+	     * 仅运行/启动途中的态响应；CMD_STOP 硬停--STOPPED
+	     * 集中于此预分流，避免 switch 各 case 重复处理 STOP。 */
+        s_motor_state = MOTOR_STATE_STOPPED;
+    }
+    
+    switch (s_motor_state) {
+        case MOTOR_STATE_FAULT:
+            /* 故障吸收态：硬关 6 管 + 清占空比，与 STOPPED 动作一致。
+             * 区别在于：此处拒绝任何启动路径，仅响应"清故障"事件。
+             * fault 已由上文前置分流，本 case 进入时 fault 必为 true；
+             * 当外部清故障后，下一拍 fault=false，本分支转出 → STOPPED。 */
+            Drive_Enable(false);
+            if (MC_Ramp_GetCurrentDuty() != 0) MC_Ramp_ForceZero();
+            if (!MC_HasAnyFault()) {
+                s_motor_state = MOTOR_STATE_STOPPED;
+            }
+            break;
+
+        case MOTOR_STATE_STOPPED:
+            /* 停机：关驱动输出（模式分发）+ 清占空比。
+             * 启动条件：START_FWD/START_REV → 记录期望方向后进入预充电瞬态。
+             * 方向命令只在此处响应：其余态（含 READY/运行）不响应启动命令，
+             * 因此换向必须先 STOP 回 STOPPED。
+             * 注意：此处只记 s_direction，不切 HALL 参考系 —— 硬停后转子
+             * 可能仍在原方向惰行，须等 READY 停稳门确认停稳后再锁存。 */
+            Drive_Enable(false);
+            if (MC_Ramp_GetCurrentDuty() != 0) MC_Ramp_ForceZero();
+            if (cmd == MOTOR_CMD_START_FWD || cmd == MOTOR_CMD_START_REV) {
+                s_direction = (cmd == MOTOR_CMD_START_REV) ? HALL_DIR_REV : HALL_DIR_FWD;
+                s_motor_state = MOTOR_STATE_BOOTSTRAP;
+            }
+            break;
+
+        case MOTOR_STATE_BOOTSTRAP:
+            /* 瞬态：自举充电，下桥 50% PWM 充电
+             * (HOFF_LPWM：风车态限流 + PDC 预置 50% 中点便于交接，先置 PDC 再切 Override)。 */
+            PWM_SetDuty_UVW(BOOTSTRAP_CHARGE_DUTY, BOOTSTRAP_CHARGE_DUTY, BOOTSTRAP_CHARGE_DUTY);
+            PWM_HighOffLowPwm();
+            s_bootstrap_start_ms = MC_GetTickMs();
+            s_motor_state = MOTOR_STATE_CHARGING;
+            break;
+
+        case MOTOR_STATE_CHARGING:
+            /* 稳态：等待 50ms 自举电容充电完成。 */
+            if ((MC_GetTickMs() - s_bootstrap_start_ms) >= BOOTSTRAP_CHARGE_MS) {
+				/*本拍只负责关断所有mos，以结束自举电容充电
+				 *下一拍才进入调制输出
+				 *所以关闭所有Mos后，有一拍的关断裕量，不会误直通
+			     */
+				PWM_AllOff();
+				//关断裕量：为一拍
+                s_ready_ms = 0;
+                s_motor_state = MOTOR_STATE_READY;
+            }
+            break;
+
+        case MOTOR_STATE_READY:
+            /* 就绪：自举已充，等旋钮指令。
+             * 方向锁存 + 停稳门（必须在 HALL_ResetForStart() 之前判断，
+             * 否则边沿年龄会被清零，永远等不到停稳）：
+             *   - 方向未变：直接放行（同方向重启不需要等转子停）；
+             *   - 方向改变：等 Hall 边沿静默 ≥ REV_EDGE_QUIET_MS，确认转子已停，
+             *     再调用 HALL_SetDirection 锁存参考系（HALL 模块唯一持有）。
+             * 转子仍在惰行时保持 READY，本拍不启动。
+             *
+             * READY 的驱动闸门取决于进入路径（勿混）：
+             *   - STOPPED→BOOTSTRAP→CHARGING→READY：CHARGING 末拍已 PWM_AllOff，
+             *     本态不再使能，桥臂 6 管强制关断；
+             *   - RUNNING 缓停到 duty=0→READY：未调 Drive_Enable(false)，
+             *     使能保持 true，桥臂维持 50% 中点互补开关（三相共模零矢量，
+             *     差压≈0；下桥每周期导通一半，对惰行转子有动态制动效果）。 */
+            if (s_direction != HALL_GetDirection()) {
+                if (HALL_MsSinceLastEdge() < REV_EDGE_QUIET_MS) {
+                    break;   /* 等转子停稳 */
+                }
+                HALL_SetDirection(s_direction);
+            }
+
+            /* 旋钮 ≥ READY_MIN_KNOB → STARTUP（固定低 duty 500ms，再进 RUNNING）；
+             * 超时30s且旋钮=0 → STOPPED */
+            if (MC_GetKnobSpeed() >= READY_MIN_KNOB_UQ16) {
+            	/* 重置霍尔边沿计时基准:把 HALL_TIMEOUT 窗口从"进入运行"起算,
+                 * 防长时间停机后重启时旧时戳导致首个 RUNNING 拍误报 HALL_TIMEOUT。 */
+            	HALL_ResetForStart();
+                /* 静止时 dt=0 会让转子角积分冻结；用 50rpm 种子让角度立即旋转，
+                 * 真实 Hall 沿到来后由 HALL_UpdateDt 自动替换。 */
+                Motor_SeedRotorSpeed();
+                /* 启动前按当前 Hall 重新播种，避免自举/惰行期间积分角漂移。 */
+                RotorAngle_Seed();
+                /* 启动保持：先固定低 duty，让转子加速、反电动势建立；
+                 * 500ms 后再进 RUNNING，由 MC_Ramp_Step 按旋钮目标继续缓变。
+                 * 驱动使能在 STARTUP 入口完成（先预置 50% 零矢量再交还互补）。 */
+                MC_Ramp_HoldDuty(MOTOR_STARTUP_DUTY);
+                s_startup_ms = MC_GetTickMs();
+                Drive_Enable(true);
+                s_motor_state = MOTOR_STATE_STARTUP;
+            } else if (++s_ready_ms >= READY_TIMEOUT_MS) {
+                s_motor_state = MOTOR_STATE_STOPPED;
+            }
+            break;
+
+        case MOTOR_STATE_STARTUP:
+            /* 固定低 duty，等转子加速、反电动势建立。
+             * 输出由 50µs Motor_Tick50us → Drive_Output 负责。
+             * 时间到进 RUNNING；RUNNING 的 MC_Ramp_Step 会从当前 duty 继续
+             * 按旋钮目标缓变（不会回到 0 重新爬）。 */
+            if ((uint16_t)(MC_GetTickMs() - s_startup_ms) >= MOTOR_STARTUP_MS) {
+                s_motor_state = MOTOR_STATE_RUNNING;
+            }
+            break;
+
+        case MOTOR_STATE_RUNNING:
+            /* CMD_STOP 已在顶部预分流硬停 → STOPPED（立即关 PWM）。
+             * 旋钮 < RUN_MIN_KNOB → 请求缓停，幅值降到 0 后回 READY。 */
+            if (MC_GetKnobSpeed() < RUN_MIN_KNOB_UQ16) {
+                MC_Ramp_RequestStop();
+            }
+			MC_Ramp_Step();
+            /* 缓停完成：幅值已到 0 且旋钮仍低于运行下限 → READY。
+             * 注意：本迁移不调 Drive_Enable(false)，驱动闸门保持 true，
+             * 桥臂继续 50% 中点互补开关（详见 READY case 的说明）；
+             * 彻底关断仍由 STOPPED / FAULT 负责。 */
+            if (MC_Ramp_GetCurrentDuty() == 0u &&
+                MC_GetKnobSpeed() < RUN_MIN_KNOB_UQ16) {
+                s_ready_ms = 0;
+                s_motor_state = MOTOR_STATE_READY;
+            }
+            break;
+    }
+}
+
+/*
+ * 获取电机统一句柄（快照聚合）
+ * 每次调用刷新全部动态字段（state/mode/fault/hall/en/duty/age/angle）。
+ * ramp 指针为绑定关系，初始化后不变。
+ *
+ * 仅允许在主循环（Tier-2/Tier-3）上下文调用；严禁 ISR 内调用
+ * （多字段非原子快照，存在读撕裂风险）。
+ */
+Motor_Handle_t* Motor_GetHandle(void) {
+    s_motor_handle.state            = s_motor_state;
+    s_motor_handle.dir              = (uint8_t)s_direction;
+    s_motor_handle.active_dir       = (uint8_t)HALL_GetDirection();
+    s_motor_handle.fault            = MC_GetFault();
+    s_motor_handle.hall_status      = HALL_GetHallStatus();
+    s_motor_handle.drive_en         = Drive_IsEnabled();
+    s_motor_handle.target_duty      = s_motor_handle.ramp->target_duty;
+    s_motor_handle.current_duty     = MC_Ramp_GetCurrentDuty();
+    s_motor_handle.last_edge_age_ms = HALL_MsSinceLastEdge();
+    s_motor_handle.rotor_angle16    = RotorAngle_GetRotor16();
+    s_motor_handle.mod_angle16      = Motor_GetModAngle16();
+    return &s_motor_handle;
+}

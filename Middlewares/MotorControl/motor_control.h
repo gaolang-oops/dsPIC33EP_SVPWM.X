@@ -1,0 +1,163 @@
+/* Microchip Technology Inc. and its subsidiaries.  You may use this software 
+ * and any derivatives exclusively with Microchip products. 
+ * 
+ * THIS SOFTWARE IS SUPPLIED BY MICROCHIP "AS IS".  NO WARRANTIES, WHETHER 
+ * EXPRESS, IMPLIED OR STATUTORY, APPLY TO THIS SOFTWARE, INCLUDING ANY IMPLIED 
+ * WARRANTIES OF NON-INFRINGEMENT, MERCHANTABILITY, AND FITNESS FOR A 
+ * PARTICULAR PURPOSE, OR ITS INTERACTION WITH MICROCHIP PRODUCTS, COMBINATION 
+ * WITH ANY OTHER PRODUCTS, OR USE IN ANY APPLICATION. 
+ *
+ * IN NO EVENT WILL MICROCHIP BE LIABLE FOR ANY INDIRECT, SPECIAL, PUNITIVE, 
+ * INCIDENTAL OR CONSEQUENTIAL LOSS, DAMAGE, COST OR EXPENSE OF ANY KIND 
+ * WHATSOEVER RELATED TO THE SOFTWARE, HOWEVER CAUSED, EVEN IF MICROCHIP HAS 
+ * BEEN ADVISED OF THE POSSIBILITY OR THE DAMAGES ARE FORESEEABLE.  TO THE 
+ * FULLEST EXTENT ALLOWED BY LAW, MICROCHIP'S TOTAL LIABILITY ON ALL CLAIMS 
+ * IN ANY WAY RELATED TO THIS SOFTWARE WILL NOT EXCEED THE AMOUNT OF FEES, IF 
+ * ANY, THAT YOU HAVE PAID DIRECTLY TO MICROCHIP FOR THIS SOFTWARE.
+ *
+ * MICROCHIP PROVIDES THIS SOFTWARE CONDITIONALLY UPON YOUR ACCEPTANCE OF THESE 
+ * TERMS. 
+ */
+
+/* 
+ * File:   
+ * Author: 
+ * Comments:
+ * Revision history: 
+ */
+
+// This is a guard condition so that contents of this file are not included
+// more than once.
+#ifndef MOTOR_CONTROL_H
+#define MOTOR_CONTROL_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "mc_ramp.h"
+#include "MC_Fault.h"   /* Motor_Handle_t.fault 字段类型 */
+
+/* ============ 驱动方式：SPWM 正弦调制（唯一驱动方式）============
+ *   SPWM ↔ 中心对齐 PWM（CAM=1, PHASE=3500, TRGDIV=1:2）
+ *
+ * !! 硬件配对同步规则（改动 PWM 配置时须手动同步）!!
+ *   1) bsp_freq.h 的 BSP_PWM_ALIGNMENT（对齐模式编译期派生：PHASE/占空满量程）
+ *   2) MCC GUI（PWM 对齐模式 + 触发分频 TRGDIV）并重新生成
+ *   3) MCC GUI 中断优先级（Interrupt 模块）：
+ *      AD1 > IC1/IC2/IC3（调制 tick 零抖动；Hall 延迟由 IC 硬件时戳兜底）
+ *      T3（IC 捕获时基）恒低于 AD1 与 IC1~3
+ *      main.c SelfCheck_Report 对实际 IPC 寄存器做关系校验，不满足即停机
+ */
+
+/* 自举电容预充电时长（计时职责归状态机，故宏定义于此）*/
+#define BOOTSTRAP_CHARGE_MS         50U
+
+/* SPWM 启动保持（READY→STARTUP）：固定低 duty 让转子加速、反电动势建立，
+ * 时间到再进 RUNNING 按旋钮目标继续缓变。
+ *   duty 500 / 3500 ≈ 14.3% 满量程 ≈ 3.4V 相电压。 */
+#define MOTOR_STARTUP_DUTY          500U
+#define MOTOR_STARTUP_MS            500U
+
+/* SPWM 调制中点（50% 共模零矢量，三相差压=0）：自举充电占空用（本层唯一直用点）。
+ * spwm.c 侧同值同源宏为 HALF_OF_DUTY_FULLSCALE（调制基线 + 使能交接零矢量）。
+ * 宏体引用 MC_DUTY_FULLSCALE 属惰性展开，消费方 motor_control.c 已含 mc_services.h。 */
+#define SPWM_DUTY_MID               (MC_DUTY_FULLSCALE >> 1)
+#define BOOTSTRAP_CHARGE_DUTY       SPWM_DUTY_MID
+
+/* SPWM 调制角超前量（电角度，brad16）：电压矢量落 q 轴，最大转矩。
+ *   θmod = θr + 90°（FWD） / θr − 90°（REV）
+ * 90° = 65536/4 = 0x4000。 */
+#define SPWM_ANGLE_LEAD_Q16         ((int16_t)0x4000)
+
+#ifdef	__cplusplus
+extern "C" {
+#endif /* __cplusplus */
+
+typedef enum {
+    MOTOR_STATE_STOPPED = 0,   // 停机：硬关 6 管(PWM_AllOff)，等 KEY0(正转)/KEY1(反转) 启动
+    MOTOR_STATE_FAULT,         // 故障吸收态：任意态+fault 进入；仅外部清故障可转出→STOPPED
+    MOTOR_STATE_BOOTSTRAP,     // 瞬态：自举充电启动(下桥 PWM HOFF_LPWM)，立即迁移到 CHARGING
+    MOTOR_STATE_CHARGING,      // 稳态：等待自举电容充电 50ms 完成
+    MOTOR_STATE_READY,         // 就绪：自举已充，等旋钮指令（不响应启停键）；CHARGING 进入=桥臂全关，
+                               // RUNNING 缓停进入=驱动仍使能(50% 零矢量)；超时回 STOPPED
+    MOTOR_STATE_STARTUP,       // SPWM 启动保持：固定低 duty，等转子加速/反电动势建立
+    MOTOR_STATE_RUNNING,       // 运行：按指令占空比输出
+} Motor_State_e;
+
+#define READY_TIMEOUT_MS    30000U
+
+/* 反向启动"停稳门"(ms)：Hall 边沿静默超过此时长才认为转子已停稳。
+ * 用途：方向变化时，必须等转子真正停下，才允许切换观测器参考系
+ * （θ 积分符号 / 反向 Hall 进入角表 / −90° 超前角），否则观测器会按
+ * 新方向积分而转子仍在旧方向惰行 → θ 错扇区、反向启动电流大。
+ * 60° 一个 Hall 边沿，200ms 约对应 <25 rpm。
+ * 建议保持 < MC_Fault 的 HALL_TIMEOUT_MS(500)，留出裕量。 */
+#define REV_EDGE_QUIET_MS   200U
+
+/* 应用层 → 状态机 的一次性命令（对齐 ST MCSDK DirectCommand 思想）。
+ * 应用层（按键/协议）写，状态机每拍快照后清零消费 —— 状态机不写回，
+ * 重启须显式再次下发 START_xxx（故障清除 / 超时后自动 re-arm，无电平残留）。
+ *
+ * 方向只在启动命令里携带，且仅 STOPPED 态响应：
+ * 运行/充电/READY 期间按反方向键被忽略，必须先 STOP → STOPPED 再换向，
+ * 杜绝带速反向启动（转动过程不做反向切换）。
+ * STOPPED 只记录期望方向(s_direction)，真正的观测器参考方向切换
+ * (HALL_SetDirection) 延迟到 READY 且确认转子停稳后执行；
+ * 参考方向由 HALL 模块唯一持有，控制层不另存副本。 */
+typedef enum {
+    MOTOR_CMD_NONE      = 0,   /* 空命令 */
+    MOTOR_CMD_START_FWD,       /* 正转启动（KEY0）→ 仅 STOPPED 态响应 */
+    MOTOR_CMD_START_REV,       /* 反转启动（KEY1）→ 仅 STOPPED 态响应 */
+    MOTOR_CMD_STOP,            /* 请求停机（KEY2 短按）→ 立即硬关 PWM + 清占空比 → STOPPED */
+} Motor_Cmd_e;
+
+/*
+ * 电机统一句柄（聚合各子模块状态入口）
+ * 静态模块（static 变量）通过指针/快照方式挂入此处。
+ *
+ * 约束：
+ *   - 本结构是【只读诊断视图】，真值仍由各子模块的 static 变量持有。
+ *   - 严禁通过本结构写真值；任何状态变更必须经各子模块 API。
+ *   - Motor_GetHandle() 仅允许在主循环（Tier-2/Tier-3）上下文调用，
+ *     禁止在 ISR 内调用（多字段非原子快照，存在读撕裂风险）。
+ */
+typedef struct {
+    /* —— 状态机层 —— */
+    Motor_State_e  state;          /* 状态机当前状态 */
+    uint8_t        dir;            /* 期望方向快照 s_direction（0=FWD / 1=REV，同 HALL_Dir_e） */
+    uint8_t        active_dir;     /* 观测器当前参考方向 HALL_GetDirection()（未停稳前可能仍为旧方向） */
+    /* —— 子模块指针（视图，不拥有） —— */
+    Ramp_Handle_t *ramp;           /* 占空比缓变句柄指针 */
+    /* —— 子模块快照（GetHandle 时刷新） —— */
+    MC_Fault_e     fault;          /* 故障位图（全锁存，只读视图） */
+    uint8_t        hall_status;    /* 当前 Hall 状态 */
+    bool           drive_en;       /* 驱动闸门（SPWM_IsEnabled 快照） */
+    uint16_t       target_duty;    /* 目标占空比（旋钮/速度PI 输出） */
+    uint16_t       current_duty;   /* 实际占空比（缓变后） */
+    uint16_t       last_edge_age_ms; /* 距上次 Hall 边沿 ms（堵转观测） */
+    uint16_t       rotor_angle16;    /* 连续电气角（brad16） */
+    uint16_t       mod_angle16;      /* 合成后的调制角（brad16） */
+} Motor_Handle_t;
+
+void Motor_Init(void);                 // 单一入口，内部包装全部 motor 层子模块初始化
+void Motor_Tick(void);                 // 1ms 节拍推进状态机（Tier-2 控制层，由主循环调用）
+void Motor_SetCommand(Motor_Cmd_e cmd);// 应用层下发一次性命令（START_FWD/START_REV/STOP），状态机消费即清零
+
+/* 获取电机统一句柄（快照方式，调试/监控用）
+ * 含连续电气角 rotor_angle16 与合成调制角 mod_angle16
+ * （0~65535 brad16）。 */
+Motor_Handle_t* Motor_GetHandle(void);
+
+/* 由转子角 θr 合成 SPWM 调制角（供调制链消费）：
+ *   FWD: θmod = θr + 90°
+ *   REV: θmod = θr − 90°
+ * 返回 brad16（0~65535 ⇔ 0~360°，uint16 加法溢出自动回卷）。
+ * 并发：读取 16 位 θ 整数部分，单字原子，主循环/ISR 均可调用。 */
+uint16_t Motor_GetModAngle16(void);
+
+#ifdef	__cplusplus
+}
+#endif /* __cplusplus */
+
+#endif	/* MOTOR_CONTROL_H */
+
+

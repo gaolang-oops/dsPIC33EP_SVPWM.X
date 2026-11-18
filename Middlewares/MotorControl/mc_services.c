@@ -1,0 +1,83 @@
+/*
+ * mc_services.c
+ *
+ * Motor 层平台服务门面实现：转发 BSP 工程单位接口给 motor 层。
+ *   - raw 换算、过流 raw 判定、标定常量 全部封装在 BSP 层（bsp_adc.c）；
+ *   - 本文件仅做纯转发，motor 层只见物理量(mA/mV)与语义结果(bool)。
+ *   其余 motor 模块经此获取时基 / 工程单位采样值 / 指令输入 / 精确延时。
+ *
+ * 单位换算（raw→mA/mV/duty）全部在 BSP 层完成，与 BSP_ADC_GetVbusMv 同构。
+ * 换板子/换采样链路时，标定参数改 bsp_adc.h 一份即可。
+ */
+
+#include "mc_services.h"
+#include "../../Drivers/BSP/bsp_adc.h"
+#include "../../Drivers/BSP/bsp_freq.h"
+#include "../../Drivers/BSP/bsp_timer.h"
+#include "../../Drivers/BSP/bsp_ICx.h"
+
+#define MC_SPEED_MIN_UQ16           3277u //3277/65536=0.05 ~ 5%
+#define MC_SPEED_MAX_UQ16			62259u //62259/65536=0.9499969 ~ 95%
+
+uint16_t MC_GetKnobSpeed(void) {
+	//knob：旋钮值UQ0.16 [0,1) 
+	uint16_t norm_uq0_16 = BSP_ADC_Knob_Value();
+	/* 限幅 [SPEED_MIN, SPEED_MAX] */
+    if (norm_uq0_16 < MC_SPEED_MIN_UQ16) norm_uq0_16 = 0;
+    if (norm_uq0_16 > MC_SPEED_MAX_UQ16) norm_uq0_16 = MC_SPEED_MAX_UQ16;
+
+	return norm_uq0_16;
+}
+
+uint16_t MC_GetTickMs(void) {
+    return BSP_Timer_NowMs();
+}
+
+uint16_t MC_GetTick50us(void) {
+    return BSP_ADC_TimeBase_GetTick50us();
+}
+
+void MC_RegisterTick50us(void (*cb)(void)) {
+    BSP_ADC_TimeBase_Register50us(cb);
+}
+
+void MC_Delay10us(uint16_t n) {
+    BSP_Timer_Delay10us(n);
+}
+
+/* 纯转发：raw→mA 换算在 BSP 层（BSP_ADC_GetCurrentXMa）*/
+int16_t MC_GetCurrentIamA(void)   { return BSP_ADC_GetCurrentIaMa(); }
+int16_t MC_GetCurrentIbmA(void)   { return BSP_ADC_GetCurrentIbMa(); }
+int16_t MC_GetCurrentIcmA(void)   { return BSP_ADC_GetCurrentIcMa(); }
+int16_t MC_GetCurrentIbusmA(void) { return BSP_ADC_GetCurrentIbusMa(); }
+
+/* 同一拍的 raw 快照（诊断用）。BSP 数据指针指向 ISR 已更新完的 s_adcData，
+ * 4 个 uint16 读均为单字原子；仅在过流跳闸时调用，不在 50us 热路径。 */
+void MC_GetCurrentRawSnapshot(uint16_t *ia, uint16_t *ib,
+                              uint16_t *ic, uint16_t *ibus)
+{
+    const volatile ADC_Data_t *d = BSP_ADC_GetData();
+
+    *ia   = d->raw_ia;
+    *ib   = d->raw_ib;
+    *ic   = d->raw_ic;
+    *ibus = d->raw_ibus;
+}
+
+/* 纯转发：过流判定封装在 BSP 层（raw 比较 + 标定预计算）*/
+void MC_OC_Configure(uint16_t threshold_mA) { BSP_ADC_OC_Configure(threshold_mA); }
+bool MC_OC_IsPhaseOver(void)                { return BSP_ADC_OC_IsPhaseOver(); }
+bool MC_OC_IsIbusOver(void)                 { return BSP_ADC_OC_IsIbusOver(); }
+
+uint16_t MC_GetVbusMv(void) {
+    return BSP_ADC_GetVbusMv();
+}
+
+uint8_t MC_Hall_ReadStatus(void) {
+    return BSP_ICx_ReadHall();
+}
+
+void MC_Hall_RegisterIsr(MC_HallIsrHandler_t handler) {
+    BSP_ICx_RegisterIsrHandler(handler);
+}
+

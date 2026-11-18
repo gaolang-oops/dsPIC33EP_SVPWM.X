@@ -1,0 +1,121 @@
+/* 
+ * File:   
+ * Author: 
+ * Comments:
+ * Revision history: 
+ */
+
+// This is a guard condition so that contents of this file are not included
+// more than once.  
+#ifndef HALL_SPEED_FDBK_H
+#define	HALL_SPEED_FDBK_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+typedef void (*HallEdgeCallback_t)(uint8_t hall);
+void     HALL_Init(void);                 /* 含种子读取 + 经 mc_services 注册 ISR */
+uint8_t  HALL_GetHallStatus(void);
+void     HALL_RegisterOnEdge(HallEdgeCallback_t cb);
+
+/* ============ 方向 / Hall 转子位置（电角度） ============ */
+
+/* Hall 非法态(000/111)对应的角度哨兵值 */
+#define HALL_ANGLE_INVALID   0xFFFFu
+
+/* 电机旋转方向。正转: Hall 5→4→6→2→3→1；反转: Hall 1→3→2→6→4→5。
+ *
+ * 本模块区分两个方向：
+ *   - 参考方向(ref)：控制层锁存给观测器的旋转参考系，决定 HALL_GetThetaStep()
+ *     的符号与 Hall 进入角查表；由控制层在启动/停稳锁存时写入（对齐 ST 的
+ *     HALL_SetDirection / STO_SetDirection 语义）；
+ *   - 实测方向(meas)：由相邻两次合法 Hall 跳变自动判别，仅供监督/诊断。
+ * 两者暂不做一致性判定。
+ */
+typedef enum {
+    HALL_DIR_FWD = 0,   /* 正转 */
+    HALL_DIR_REV = 1,   /* 反转 */
+} HALL_Dir_e;
+
+/* 实测方向：Hall 沿自动判别。无有效跳变时保持上次值。
+ * 仅用于监督/诊断，不参与 HALL_GetThetaStep() 的符号。 */
+HALL_Dir_e HALL_GetMeasuredDirection(void);
+
+/* 参考方向：观测器内部持有的旋转参考系，默认 HALL_DIR_FWD。
+ * 决定 HALL_GetThetaStep() 的符号与 Hall 进入角查表；由控制层在
+ * 启动/停稳锁存时设置，本模块是它的唯一持有者（控制层不另存副本）。
+ * 并发：主循环写、Hall ISR 读，单字写原子。 */
+HALL_Dir_e HALL_GetDirection(void);
+void       HALL_SetDirection(HALL_Dir_e dir);
+
+/* 当前 Hall 状态对应的转子位置（brad16：0~65535 ⇔ 0~360°）。该 Hall 扇区瞬间的绝对位置（进入沿）。
+ * 本接口按参考方向(ref)选表：与 HALL_GetThetaStep() 的积分方向保持同一参考系，
+ * 供每 Hall 沿重同步 theta 使用。
+ *   正转 5[210°]→4[270°]→6[330°]→2[30°]→3[90°]→1[150°]
+ *   反转 1[210°]→3[150°]→2[90°]→6[30°]→4[330°]→5[270°]
+ * 返回 HALL_ANGLE_INVALID 表示当前 Hall 非法(0/7)。 */
+uint16_t HALL_GetHallRotorPosition(void);
+
+/* 最近最多 6 个有效跨通道 60° 间隔的滑动平均（T3CLK tick，当前 3657ns/tick）。
+ *   每个合法 Hall 边沿更新一次；漏沿 120° 时先用 dt/2 归一到 60°；
+ *   启动阶段为已收集样本的平均，满 6 个后固定为 6 样本平均。
+ *   若本次捕获溢出/积压/间隔异常，保留上一次平均值不覆盖。
+ *   结果按最高转速钳位：dt 不小于 HALL_DT_MAX_SPEED_TICKS（342 tick，
+ *   对应 4000 rpm @ p=2），因此 HALL_GetThetaStep() 也不会超过该转速。
+ *   0 = 尚未建立，或已被 HALL_ResetForStart() 清零
+ *       （随后通常紧跟 HALL_SeedDt() 播种为非 0）。
+ * 消费方须结合 HALL_MsSinceLastEdge() 判断数据是否新鲜（停机后旧值会保留）。 */
+uint16_t HALL_GetEdgeDtTicks(void);
+
+/* 每 PWM 周期电角度增量（16.16 定点，有符号）：
+ *   高 16 位 = 整数 brad16/PWM，低 16 位 = 1/65536 brad16 小数。
+ *   符号由参考方向(ref)决定：FWD > 0，REV < 0（二进制补码）；
+ *   实测方向(meas)不参与本符号，仅用于监督/诊断。
+ *
+ * 累加必须用无符号累加器：theta_u32 += (uint32_t)step;
+ *   —— 有符号加法溢出是 C 的未定义行为；无符号加法则是模 2^32 的良定义回卷。
+ *
+ * 需要拆整数/小数时：whole = step >> 16; frac = step & 0xFFFFu;
+ *   负数时 whole 是向下取整（floor），frac 恒为非负的小数部分，
+ *   即 value = whole + frac/65536。
+ */
+typedef int32_t HALL_StepQ16_t;
+
+/* 钳位后的滑动平均 60° dt 对应的每 PWM 角度增量（16.16，已按参考方向应用符号）。
+ *   参考方向 FWD -> 正值，REV -> 负值（二进制补码）。
+ *   消费方统一 theta_u32 += (uint32_t)step 即可。
+ *   无效/溢出/超窗/尚未建立时保持上一次值。 */
+HALL_StepQ16_t HALL_GetThetaStep(void);
+
+/* 启动种子：在还没有 Hall 边沿时，给 60° 间隔 dt 一个初值，并同步刷新
+ * dt_ticks / step / 边沿计时，使 RotorAngle 立即开始积分（否则 dt=0 会冻结）。
+ * 调用时机：进入 RUNNING 前（HALL_ResetForStart 之后）。
+ * 真实 Hall 沿到来后，HALL_UpdateDt/HALL_UpdateStep 会用实测 dt 替换种子。
+ * dt_ticks 会被钳到 [HALL_DT_MAX_SPEED_TICKS, HALL_DT_MAX_TICKS]。 */
+void HALL_SeedDt(uint16_t dt_ticks);
+
+/* 调试用：返回每 PWM 角度增量公式中的常数 K（brad16 每 T3 tick）。
+ * 当前配置（Fcy=70MHz、Fpwm=20kHz、T3 1:256）下应为 149333。 */
+uint32_t HALL_GetStepK(void);
+
+/* 速度反馈(速度环接缝,预留):
+ * 返回电机转速 RPM,基于 HALL_GetEdgeDtTicks() 换算。
+ * 本次仅占位返回 0,实际测速算法待加速度环时实现。
+ * 消费方: Tier-2(1ms) 调用,经 MC_Ramp_SetTargetProvider 注入速度 PI 输出。 */
+uint16_t HALL_GetSpeedRpm(void);
+
+/* 距上次合法 Hall 边沿经过的时间(ms)。供堵转检测/速度有效性判断。
+ * 0 表示刚发生边沿;值越大说明电机越慢或停转。 */
+uint16_t HALL_MsSinceLastEdge(void);
+
+/* 启动前重置 Hall 测量基准：刷新“距上次边沿”时戳 + 清空 dt/step/滑动平均。
+ * 进入 RUNNING 态前调用：既避免长时停机后误报 HALL_TIMEOUT，
+ * 又丢弃上次运行的旧测速数据（详见 .c 实现注释）。
+ * 之后通常紧跟 HALL_SeedDt() 播种。 */
+void HALL_ResetForStart(void);
+
+/* TODO: 极对数 POLE_PAIR_NUM 须在实现 GetSpeedRpm 前定义 */
+
+
+#endif	/* HALL_SPEED_FDBK_H */
+

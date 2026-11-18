@@ -1,0 +1,25 @@
+# MPLAB X build outputs
+build/
+dist/
+debug/
+
+# MPLAB X user-local IDE settings
+nbproject/private/
+
+# MCC autosave metadata (regenerated on every save)
+mcc-manifest-autosave.yml
+
+# MPLAB X IDE-regenerated Makefiles (derived from configurations.xml)
+nbproject/Makefile-*
+nbproject/gen/
+
+# Generated files marker
+.generated_files/
+
+# Log files
+*.log
+*.log.inx
+
+# OS files
+Thumbs.db
+.DS_Store

@@ -1,0 +1,136 @@
+/*
+ * spwm.h
+ *
+ * 三相正弦（SPWM）模块：
+ *   1) 正弦计算（纯函数）：由 brad16 电角度 θ 经 SinCos16 查表生成互差 120° 的
+ *      三相正弦波 Ua/Ub/Uc，及"幅值指令 + 电角度 → 三相占空比"映射；
+ *   2) 使能闸门 SPWM_Enable：
+ *      en=true 预置零矢量后交还 PWM 互补自主控制，en=false 硬关 6 管。
+ *
+ * 依赖方向：spwm ──▶ sincos（纯查表）；
+ *           使能闸门 spwm ──▶ pwm_common（寄存器唯一所有者，本模块不直接触碰寄存器）。
+ *
+ * 定点约定：
+ *   计算输出为 Q1.15 归一化电压（真实值 = 分量 / 32768，无量纲），
+ *   后续由上层按调制度映射为 PWM 占空比（最终落点：本项目 PDC 寄存器）。
+ *
+ * 相序（正转，正序；与 spwm.c 实现、Docs/…/Hall与电动势波形.svg 一致）：
+ *   Ua = cos(θ)
+ *   Ub = cos(θ − 120°) = −½cosθ + (√3/2)sinθ   （V 滞后 U 120°）
+ *   Uc = cos(θ + 120°) = −½cosθ − (√3/2)sinθ   （W 超前 U 120°）
+ *   由同一次 SinCos16(θ) 的 (cosθ, sinθ) 代数合成，V/W 相不再单独查表。
+ *   任一角三相平衡：Ua + Ub + Uc ≡ 0。
+ *   Clark 变换后矢量 = (cosθ, sinθ)，即矢量角 ≡ θ，与 θ 同向旋转
+ *   （上层取 θ = θr + 90° 时矢量落在 q 轴，最大转矩）。
+ *   如需反序（反转），把 Ub/Uc 的 ±(√3/2)sinθ 项对调即可（等价于 V/W 相标签互换）。
+ *   注意：写成 Ub = cos(θ + 120°) / Uc = cos(θ − 120°) 即反序，电机反转或零转矩。
+ *
+ * brad16 特性（与 sincos 一致）：
+ *   全周 360° 映射到 uint16 满量程 65536；
+ *   uint16 加法溢出即自动 360° 回卷，负角度补码自动正确，零分支。
+ */
+
+#ifndef SPWM_H
+#define SPWM_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* 三相归一化电压结果（Q1.15，真实电压 = 分量 / 32768）*/
+typedef struct {
+    int16_t ua;   /* U 相：cos(θ)                          */
+    int16_t ub;   /* V 相：cos(θ − 120°)  滞后 U 120°      */
+    int16_t uc;   /* W 相：cos(θ + 120°)  超前 U 120°      */
+} SPWM_UabcQ15_t;
+
+/* 三相 SPWM 占空比（调用方可直接写 PDC） */
+typedef struct {
+    uint16_t u;   /* U 相占空比 */
+    uint16_t v;   /* V 相占空比 */
+    uint16_t w;   /* W 相占空比 */
+} SPWM_DutyUVW_t;
+/**
+   @Summary
+     由电角度 theta16 计算三相正弦电压 Ua/Ub/Uc（Q1.15）。
+
+   @Description
+     一次 SinCos16(θ) 查表得 (cosθ, sinθ)（Q1.15），再用 −½cosθ ± (√3/2)sinθ
+     代数合成 V/W 相，120°/240° 不重复查表。
+     正序：V 滞后 U 120°、W 超前 U 120°；返回结构含三相，调和恒为零（三相平衡），
+     可直接打印/DAC/占空比映射。
+
+   @Parameters
+     theta16  电角度（brad16：0~65535 ⇔ 0°~360°，uint16 加法回卷免费）
+
+   @Returns
+     SPWM_UabcQ15_t：ua=cosθ, ub=cos(θ−120°), uc=cos(θ+120°)，各分量 Q1.15。
+ */
+SPWM_UabcQ15_t SPWM_ComputeUabcQ15(uint16_t theta16);
+
+/**
+   @Summary
+     target_duty + 电角度 → 三相 SPWM 占空比（纯映射，无时基/硬件依赖）。
+
+   @Description
+     bipolar SPWM：duty = 满量程/2 + (target_duty × 相正弦) >> 16。
+     调制中点为死值（MC_DUTY_FULLSCALE 的一半，50% 占空），不随 target_duty 变化：
+       相正弦=0  → 三相恒 50% 共模，零差压零输出
+       相正弦=±1 → 中点 ± target_duty/2（占空幅值 = target_duty/2）
+     输出经 MC_DUTY_CLAMP 饱和到 [MC_DUTY_MIN, MC_DUTY_MAX]，
+     调制深度 > 84% 后正弦峰触界削顶；负半周由互补桥 L 管自动承载。
+     	死区280，故满量程最大：3500-280=3220; 3220/3500=92%
+     	波形中心在 50%[1750]，所以波峰爬到天花板只需再涨 3220-1750=1470 个点 → 调制范围就是1470*2=2940
+     	2940/3500=84%  即84%就开始削顶。MIN 侧同理（(1750−280)/1750 = 84%，上下对称）。
+
+   @Parameters
+     theta16      电角度（brad16：0~65535 ⇔ 0°~360°）
+     target_duty  幅值指令（PWM ticks ≤ MC_DUTY_FULLSCALE，  0 = 恒 50% 共模零输出）
+
+   @Returns
+     SPWM_DutyUVW_t：三相占空比。
+ */
+SPWM_DutyUVW_t SPWM_Duty_UVW(uint16_t theta16, uint16_t target_duty);
+
+/**
+  @Summary
+    SPWM 输出：θmod + 幅值 → 三相占空并同步写 PDC。
+
+  @Description
+    内部完成幅值限幅（防正弦峰触界削顶）、查表/三相合成与
+    PWM_SetDuty_UVW 同步写；调用方只提供调制角与缓变幅值，
+    不需要知道 SPWM_Duty_UVW / PDC 细节。
+    依赖边界：本模块不依赖 rotor_angle / Hall；theta16 由上层
+    （motor_control 的 Motor_GetModAngle16：θr ± 90°）合成后传入。
+    仅应在 SPWM_Enable(true) 且无故障时调用。
+  */
+void SPWM_Output(uint16_t theta16, uint16_t amplitude);
+
+/**
+  @Summary
+    使能/失能 SPWM 输出（驱动闸门）。
+
+  @Description
+    en=true 时：防御性重置三相 PDC=50% 中点（SPWM 零矢量，三相差压=0，
+    交接瞬间输出从"强制 00"跳到互补 50/50，无转矩冲击/无直通窗口），
+    再经 PWM_HandOffToPwm() 交还 PWM 互补自主控制。
+    en=false 时：立即硬关 6 管（PWM_AllOff，强制 H=0/L=0，优先级高于自主控制）。
+    进入 MOTOR_STATE_RUNNING 前置 true，离开（停机/故障）置 false。
+    寄存器写入全部经 pwm_common 原语，所有权仍归 pwm_common。
+ */
+void SPWM_Enable(bool en);
+
+/**
+  @Summary
+    查询 SPWM 输出是否已使能。
+ */
+bool SPWM_IsEnabled(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* SPWM_H */
