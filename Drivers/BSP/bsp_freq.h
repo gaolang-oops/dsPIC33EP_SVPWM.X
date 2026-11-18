@@ -64,8 +64,10 @@ extern "C" {
 #define BSP_PWM_ALIGNMENT      BSP_PWM_ALIGN_CENTER
 
 /* ============ PHASE 寄存器值(中心对齐半周期) ============
- * 中心对齐模式: PHASE = Fosc / (Fpwm x 预分频 x 2)。
- * 140MHz/20kHz/2 = 3500,即 PHASE1/2/3 寄存器值(MCC 写入 0xDAC)。
+ * 中心对齐模式: PHASE = Fosc / (Fpwm x PCLKDIV x 2)。
+ * 其中 PCLKDIV 为 PWM 输入时钟预分频(pwm.c: PTCON2 = 0x00 -> 1:1),
+ * 本工程取 1:1,故 140MHz/20kHz/2 = 3500,即 PHASE1/2/3 寄存器值(MCC 写入 0xDAC)。
+ * !! 若 MCC GUI 改动 PCLKDIV,本宏须同步除以该分频比,否则启动期 VERIFY(PHASE1) 死循环。
  */
 #define BSP_PWM_PHASE_TICKS         ((uint16_t)((_XTAL_FREQ) / (2UL * BSP_PWM_FREQUENCY_HZ)))
 

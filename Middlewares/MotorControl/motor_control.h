@@ -90,7 +90,7 @@ typedef enum {
  * （θ 积分符号 / 反向 Hall 进入角表 / −90° 超前角），否则观测器会按
  * 新方向积分而转子仍在旧方向惰行 → θ 错扇区、反向启动电流大。
  * 60° 一个 Hall 边沿，200ms 约对应 <25 rpm。
- * 建议保持 < MC_Fault 的 HALL_TIMEOUT_MS(500)，留出裕量。 */
+ * 建议保持 < MC_Fault 的 HALL_TIMEOUT_MS(600)，留出裕量。 */
 #define REV_EDGE_QUIET_MS   200U
 
 /* 应用层 → 状态机 的一次性命令（对齐 ST MCSDK DirectCommand 思想）。

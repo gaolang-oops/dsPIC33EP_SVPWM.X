@@ -576,5 +576,3 @@ static void HALL_OnIsr(uint8_t ch, uint16_t cap, uint8_t ovf) {
 
     if (s_on_edge) s_on_edge(cur_hall);
 }
-
-/* TODO: 实现 HALL_GetSpeedRpm 时需定义极对数 POLE_PAIR_NUM */

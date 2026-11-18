@@ -24,7 +24,9 @@ static uint16_t s_last_reported_fault = 0u;
 
 /* 发送故障帧:载荷 = [cmd, fault_hi, fault_lo, state]。
  * 故障字节序为大端(高位在前),便于串口工具直读:
- *   例 OVER_VOLTAGE(0x0002) -> [cmd, 0x00, 0x02, state]
+ *   例 OVER_CURRENT(0x0002) -> [cmd, 0x00, 0x02, state]
+ *      OVER_VOLTAGE(0x0004) -> [cmd, 0x00, 0x04, state]
+ *   位定义以 MC_Fault.h 的 MC_Fault_e 为准(bit0 过温, bit1 过流, bit2 过压 ...)。
  * 故障位图与状态机状态一帧打包,主机无需二次查询。 */
 static void MOTOR_SECTION send_fault_frame(uint8_t cmd)
 {
